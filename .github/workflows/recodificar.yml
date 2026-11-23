@@ -1,0 +1,145 @@
+name: Re-codificar chunks (sem re-renderizar)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID do run que tem os frames (Actions > clica no run > URL)"
+        required: true
+      timeline_run_id:
+        description: "ID do run que tem o timeline (geralmente o mesmo)"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  FPS: "30"
+  RENDER_W: "720"
+  RENDER_H: "1280"
+
+jobs:
+  recodificar:
+    name: Baixa frames e re-codifica cada chunk
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        scene: [0, 1, 2, 3, 4, 5]
+        chunk: ["00000", "00150", "00300", "00450"]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --fix-missing ffmpeg
+      - name: Baixar timeline
+        uses: actions/download-artifact@v4
+        with:
+          name: timeline
+          path: build
+          run-id: ${{ inputs.timeline_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verificar se chunk existe
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="s$(printf '%02d' ${{ matrix.scene }})_${{ matrix.chunk }}"
+          COUNT=$(gh api "/repos/${{ github.repository }}/actions/runs/${{ inputs.run_id }}/artifacts" \
+            --jq "[.artifacts[] | select(.name == \"chunk-$TAG\")] | length")
+          echo "exists=$COUNT" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+      - name: Baixar frames do chunk
+        if: steps.check.outputs.exists == '0'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: frames-s${{ matrix.scene }}-${{ matrix.chunk }}
+          path: frames
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Codificar chunk (se frames disponíveis)
+        if: steps.check.outputs.exists == '0'
+        continue-on-error: true
+        run: |
+          TAG="${{ steps.check.outputs.tag }}"
+          START=${{ matrix.chunk }}
+          SCENE=${{ matrix.scene }}
+          if ls frames/f${SCENE}_*.png 2>/dev/null | head -1 | grep -q png; then
+            mkdir -p chunks
+            COUNT=$(ls frames/f${SCENE}_*.png 2>/dev/null | wc -l)
+            ffmpeg -y -v error -framerate $FPS -start_number $START \
+              -i frames/f${SCENE}_%05d.png -frames:v $COUNT \
+              -c:v libx264 -crf 10 -preset veryfast -pix_fmt yuv420p chunks/c_${TAG}.mp4
+            echo "CODIFICADO $TAG ($COUNT frames)"
+          else
+            echo "SEM FRAMES para $TAG (normal se chunk não existia)"
+          fi
+      - name: Subir chunk re-codificado
+        if: steps.check.outputs.exists == '0'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ steps.check.outputs.tag }}
+          path: chunks/c_${{ steps.check.outputs.tag }}.mp4
+          retention-days: 3
+
+  montar:
+    name: Montar vídeo final
+    needs: recodificar
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: sudo apt-get update && sudo apt-get install -y --fix-missing ffmpeg
+      - run: pip install pillow num2words
+      - run: bash pipeline/get_fonts.sh
+      - name: Baixar timeline
+        uses: actions/download-artifact@v4
+        with:
+          name: timeline
+          path: build
+          run-id: ${{ inputs.timeline_run_id }}
+          github-token: ${{ github.token }}
+      - name: Baixar TODOS os chunks (run original + re-codificados)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p chunks
+          # chunks do run atual (re-codificados)
+          gh run download ${{ github.run_id }} -D chunks_new --pattern "chunk-*" 2>/dev/null || true
+          # chunks do run original que JÁ ESTAVAM bons
+          gh run download ${{ inputs.run_id }} -D chunks_orig --pattern "chunk-*" 2>/dev/null || true
+          # Mescla: novo tem prioridade
+          find chunks_orig -name "*.mp4" -exec cp -n {} chunks/ \; 2>/dev/null || true
+          find chunks_new  -name "*.mp4" -exec cp    {} chunks/ \; 2>/dev/null || true
+          ls chunks/ | sort
+      - name: Baixar áudio
+        uses: actions/download-artifact@v4
+        with:
+          name: audio
+          path: audio
+          run-id: ${{ inputs.timeline_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+      - name: Áudio do repo (fallback)
+        run: ls audio/ 2>/dev/null || cp audio/narracao.mp3 audio/ 2>/dev/null || echo "sem audio pre-salvo"
+        continue-on-error: true
+      - name: Juntar chunks e compor HUD
+        run: |
+          for f in $(ls chunks/*.mp4 2>/dev/null | sort); do echo "file '$(realpath $f)'"; done > list.txt
+          cat list.txt
+          ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy build/raw3d.mp4
+          AUDIO=$(ls audio/*.mp3 2>/dev/null | head -1 || echo "audio/narracao.mp3")
+          python pipeline/compose.py --timeline build/timeline.json --video build/raw3d.mp4 --audio "$AUDIO" --out out/baleia_azul.mp4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-final
+          path: out/baleia_azul.mp4
+          retention-days: 14
+      - name: Publicar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "video-${{ github.run_number }}" out/baleia_azul.mp4 --title "Baleia Azul #${{ github.run_number }}" --notes "Re-codificado a partir do run ${{ inputs.run_id }}."
